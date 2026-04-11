@@ -79,11 +79,12 @@ def main():
         """Wait for the server to start, then open the browser."""
         import time
         time.sleep(1.5)
-        webbrowser.open('http://127.0.0.1:5050')
+        webbrowser.open('http://127.0.0.1:5000')
 
-    print("Starting web interface at http://127.0.0.1:5050")
+    print("Starting web interface at http://127.0.0.1:5000")
     threading.Thread(target=open_browser, daemon=True).start()
-    app.run(debug=False, port=5050, host='0.0.0.0')
+    # 127.0.0.1 avoids conflict with macOS AirPlay Receiver (often holds *:5000)
+    app.run(debug=False, port=5000, host='127.0.0.1')
 
 if __name__ == "__main__":
     main()

@@ -755,33 +755,145 @@ class WebAutomationBot:
                 pass
         return False
     
+    async def _discover_password_inputs(self, ctx=None) -> list:
+        """Agentically discover all password-like input fields on the current page.
+        Returns list of dicts with selector, type, id, name, visible info."""
+        if ctx is None:
+            ctx = self.page
+        try:
+            inputs = await ctx.evaluate("""() => {
+                const results = [];
+                const allInputs = document.querySelectorAll('input');
+                for (const inp of allInputs) {
+                    const type = (inp.type || '').toLowerCase();
+                    const id = inp.id || '';
+                    const name = inp.name || '';
+                    const className = inp.className || '';
+                    const ariaLabel = inp.getAttribute('aria-label') || '';
+                    const placeholder = inp.getAttribute('placeholder') || '';
+                    const visible = !!(inp.offsetParent || inp.offsetWidth || inp.offsetHeight);
+                    // consider it password-like if type is password, or class/name/aria hint at password
+                    const isPasswordLike = (
+                        type === 'password' ||
+                        className.toLowerCase().includes('password') ||
+                        name.toLowerCase().includes('password') ||
+                        id.toLowerCase().includes('password') ||
+                        ariaLabel.toLowerCase().includes('password') ||
+                        placeholder.toLowerCase().includes('password')
+                    );
+                    if (isPasswordLike && visible) {
+                        results.push({
+                            id: id,
+                            name: name,
+                            type: type,
+                            className: className,
+                            ariaLabel: ariaLabel,
+                            placeholder: placeholder,
+                            selector: id ? `input#${id}` : (name ? `input[name="${name}"]` : `input.${className.split(' ')[0]}`)
+                        });
+                    }
+                }
+                return results;
+            }""")
+            return inputs or []
+        except Exception as e:
+            logger.warning(f"Password field discovery failed: {e}")
+            return []
+
+    async def _verify_password_entered(self, ctx=None) -> bool:
+        """Verify that the password field actually has a value (non-empty)."""
+        if ctx is None:
+            ctx = self.page
+        try:
+            has_value = await ctx.evaluate("""() => {
+                const selectors = ['input#Dn-k', 'input[name="Dn-k"]', 'input.DocControlPassword', 'input[type="password"]'];
+                for (const sel of selectors) {
+                    const el = document.querySelector(sel);
+                    if (el && el.offsetParent && el.value && el.value.length > 0) return true;
+                }
+                return false;
+            }""")
+            return has_value
+        except Exception:
+            return False
+
     async def _fill_password_field(self, password: str) -> bool:
-        """Click input#Dn-k and type password using real keyboard events.
-        Field has FastEvtFieldKeyDown/FastEvtFieldFocus so needs actual key events."""
+        """Enter confirmation password using multiple strategies with agentic retry.
         
-        # Method 1: JS focus + page.keyboard (fires real key events per character)
+        Strategy order:
+        1. fill() — same simple method used during login (most reliable for Playwright)
+        2. JS focus + keyboard.type — fires real key events per character
+        3. Playwright click + keyboard.type
+        4. Agentic discovery — scan the DOM for password inputs and try each
+        5. Frame search — try all iframes
+        6. Tab-into-field fallback
+        
+        After each attempt, verifies the field actually has a value.
+        If all methods fail, takes a screenshot for debugging."""
+        
         logger.info("Attempting password entry...")
+        
+        # Known selectors for the confirmation password field
+        known_selectors = [
+            'input#Dn-k',
+            'input[name="Dn-k"]',
+            'input.DocControlPassword',
+            'input[type="password"]',
+            'input[aria-label="Password"]',
+        ]
+        
+        # ── Strategy 1: fill() — same approach as login ──
+        logger.info("  Strategy 1: fill() (same as login)...")
+        for sel in known_selectors:
+            try:
+                el = await self.page.wait_for_selector(sel, timeout=2000)
+                if el and await el.is_visible():
+                    await el.scroll_into_view_if_needed()
+                    await el.click()
+                    await self.page.fill(sel, password)
+                    await asyncio.sleep(0.1)
+                    if await self._verify_password_entered():
+                        logger.info(f"  ✓ Password entered via fill() on {sel}")
+                        return True
+                    else:
+                        logger.warning(f"  fill() on {sel} did not stick, trying next...")
+            except Exception as e:
+                logger.debug(f"  fill() on {sel} failed: {e}")
+                continue
+        
+        # ── Strategy 2: JS focus + keyboard.type (real key events) ──
+        logger.info("  Strategy 2: JS focus + keyboard.type...")
         try:
             focused = await self.page.evaluate("""() => {
-                const el = document.getElementById('Dn-k') || document.querySelector('input[name="Dn-k"]') || document.querySelector('input.DocControlPassword');
-                if (!el) return false;
-                el.scrollIntoView({block: 'center'});
-                el.focus();
-                el.click();
-                el.value = '';
-                el.dispatchEvent(new Event('focus', {bubbles: true}));
-                return true;
+                const selectors = ['#Dn-k', 'input[name="Dn-k"]', 'input.DocControlPassword', 'input[type="password"]'];
+                for (const sel of selectors) {
+                    const el = document.querySelector(sel);
+                    if (el && el.offsetParent) {
+                        el.scrollIntoView({block: 'center'});
+                        el.focus();
+                        el.click();
+                        el.value = '';
+                        el.dispatchEvent(new Event('focus', {bubbles: true}));
+                        return sel;
+                    }
+                }
+                return null;
             }""")
             if focused:
                 await asyncio.sleep(0.05)
                 await self.page.keyboard.type(password, delay=10)
-                logger.info("Password entered (JS focus + keyboard.type)")
-                return True
+                await asyncio.sleep(0.1)
+                if await self._verify_password_entered():
+                    logger.info(f"  ✓ Password entered via JS focus + keyboard.type on {focused}")
+                    return True
+                else:
+                    logger.warning("  JS focus + keyboard.type did not stick, trying next...")
         except Exception as e:
-            logger.warning(f"Password method 1 failed: {e}")
+            logger.warning(f"  Strategy 2 failed: {e}")
         
-        # Method 2: Playwright click on input then keyboard.type
-        for sel in ['input#Dn-k', 'input[name="Dn-k"]', 'input.DocControlPassword']:
+        # ── Strategy 3: Playwright click + keyboard.type ──
+        logger.info("  Strategy 3: Playwright click + keyboard.type...")
+        for sel in known_selectors:
             try:
                 el = await self.page.wait_for_selector(sel, timeout=2000)
                 if el and await el.is_visible():
@@ -791,111 +903,317 @@ class WebAutomationBot:
                     await self.page.keyboard.press('Control+a')
                     await self.page.keyboard.press('Delete')
                     await self.page.keyboard.type(password, delay=10)
-                    logger.info(f"Password entered (click {sel} + keyboard.type)")
-                    return True
-            except Exception as e:
-                logger.warning(f"Password method 2 ({sel}) failed: {e}")
+                    await asyncio.sleep(0.1)
+                    if await self._verify_password_entered():
+                        logger.info(f"  ✓ Password entered via click + keyboard.type on {sel}")
+                        return True
+                    else:
+                        logger.warning(f"  click + keyboard.type on {sel} did not stick, trying next...")
+            except Exception:
+                continue
         
-        # Method 3: same as above but searching all frames
+        # ── Strategy 4: Agentic discovery — find password inputs dynamically ──
+        logger.info("  Strategy 4: Agentic discovery — scanning DOM for password fields...")
+        discovered = await self._discover_password_inputs()
+        if discovered:
+            logger.info(f"  Discovered {len(discovered)} password-like input(s): {[d.get('selector') for d in discovered]}")
+            for field_info in discovered:
+                sel = field_info.get('selector', '')
+                if not sel or sel.startswith('input.'):
+                    # class-based selector may be unreliable, try id/name first
+                    if field_info.get('id'):
+                        sel = f"input#{field_info['id']}"
+                    elif field_info.get('name'):
+                        sel = f"input[name=\"{field_info['name']}\"]"
+                    else:
+                        continue
+                try:
+                    # Try fill() first on discovered field
+                    el = await self.page.wait_for_selector(sel, timeout=2000)
+                    if el and await el.is_visible():
+                        await el.scroll_into_view_if_needed()
+                        await el.click()
+                        await self.page.fill(sel, password)
+                        await asyncio.sleep(0.1)
+                        if await self._verify_password_entered():
+                            logger.info(f"  ✓ Password entered via agentic fill() on discovered {sel}")
+                            return True
+                        # Try keyboard.type on discovered field
+                        await el.click(force=True)
+                        await self.page.keyboard.press('Control+a')
+                        await self.page.keyboard.press('Delete')
+                        await self.page.keyboard.type(password, delay=10)
+                        await asyncio.sleep(0.1)
+                        if await self._verify_password_entered():
+                            logger.info(f"  ✓ Password entered via agentic keyboard.type on discovered {sel}")
+                            return True
+                except Exception as e:
+                    logger.debug(f"  Agentic attempt on {sel} failed: {e}")
+                    continue
+        else:
+            logger.warning("  No password-like inputs discovered on main page")
+        
+        # ── Strategy 5: Search all frames (iframes) ──
+        logger.info("  Strategy 5: Searching all frames for password field...")
         for fr in list(self.page.frames):
-            for sel in ['input#Dn-k', 'input[name="Dn-k"]']:
+            if fr == self.page.main_frame:
+                continue
+            # discover in frame
+            frame_discovered = await self._discover_password_inputs(ctx=fr)
+            for sel in known_selectors + [d.get('selector', '') for d in frame_discovered]:
+                if not sel:
+                    continue
                 try:
                     el = await fr.wait_for_selector(sel, timeout=1500)
                     if el and await el.is_visible():
                         await el.scroll_into_view_if_needed()
+                        # Try fill()
+                        try:
+                            await el.click()
+                            await fr.fill(sel, password)
+                            await asyncio.sleep(0.1)
+                            if await self._verify_password_entered(ctx=fr):
+                                logger.info(f"  ✓ Password entered via frame fill() on {sel}")
+                                return True
+                        except Exception:
+                            pass
+                        # Try keyboard.type
                         await el.click(force=True)
                         await asyncio.sleep(0.05)
                         await self.page.keyboard.press('Control+a')
                         await self.page.keyboard.press('Delete')
                         await self.page.keyboard.type(password, delay=10)
-                        logger.info("Password entered (frame + keyboard.type)")
-                        return True
+                        await asyncio.sleep(0.1)
+                        if await self._verify_password_entered(ctx=fr):
+                            logger.info(f"  ✓ Password entered via frame keyboard.type on {sel}")
+                            return True
                 except Exception:
-                    pass
+                    continue
         
-        # Method 4: Tab into field from known page state, then type
+        # ── Strategy 6: Tab-into-field fallback ──
+        logger.info("  Strategy 6: Tab into field fallback...")
         try:
             await self.page.keyboard.press('Tab')
             await asyncio.sleep(0.05)
             await self.page.keyboard.type(password, delay=10)
-            logger.info("Password entered (Tab + keyboard.type)")
-            return True
+            await asyncio.sleep(0.1)
+            if await self._verify_password_entered():
+                logger.info("  ✓ Password entered via Tab + keyboard.type")
+                return True
         except Exception as e:
-            logger.warning(f"Password method 4 failed: {e}")
+            logger.warning(f"  Tab fallback failed: {e}")
+        
+        # ── All strategies failed — agentic diagnostics ──
+        logger.error("All password entry strategies failed. Running diagnostics...")
+        try:
+            await self.page.screenshot(path="password_fail.png")
+            logger.info("  Screenshot saved as password_fail.png")
+        except Exception:
+            pass
+        try:
+            # dump all visible inputs for debugging
+            all_inputs = await self.page.evaluate("""() => {
+                return Array.from(document.querySelectorAll('input')).filter(e => e.offsetParent).map(e => ({
+                    id: e.id, name: e.name, type: e.type,
+                    class: e.className.substring(0, 60),
+                    ariaLabel: e.getAttribute('aria-label') || '',
+                    placeholder: e.placeholder || ''
+                }));
+            }""")
+            logger.info(f"  Visible inputs on page: {all_inputs}")
+        except Exception:
+            pass
         
         return False
     
+    async def _check_session_expired(self) -> bool:
+        """Check if the session has expired (page shows 'Start Over' message)."""
+        try:
+            el = await self.page.query_selector('a:has-text("Click Here to Start Over"), :has-text("session has expired")')
+            if el and await el.is_visible():
+                return True
+        except Exception:
+            pass
+        return False
+
+    async def _detect_page_state(self) -> str:
+        """Fast detection of what's on the current page using JS (no timeouts).
+        Returns: 'next', 'submit', 'password', 'ach', 'session_expired', 'unknown'"""
+        try:
+            state = await self.page.evaluate("""() => {
+                // check session expired first
+                const body = document.body ? document.body.textContent || '' : '';
+                if (body.includes('session has expired') || body.includes('Start Over')) return 'session_expired';
+                
+                // check for password field
+                const pwSelectors = ['#Dn-k', 'input[name="Dn-k"]', 'input.DocControlPassword', 'input[type="password"]'];
+                for (const sel of pwSelectors) {
+                    const el = document.querySelector(sel);
+                    if (el && el.offsetParent) return 'password';
+                }
+                
+                // check for Submit button
+                const allSpans = document.querySelectorAll('span.ActionButtonCaptionText, span');
+                let hasNext = false, hasSubmit = false;
+                for (const s of allSpans) {
+                    const t = (s.textContent || '').trim();
+                    if (t === 'Next' && s.offsetParent) hasNext = true;
+                    if (t === 'Submit' && s.offsetParent) hasSubmit = true;
+                }
+                
+                // check for ACH
+                if (body.includes('ACH Debit Bank')) {
+                    // ACH is visible, also return if next is available
+                    if (hasNext) return 'ach_with_next';
+                    return 'ach';
+                }
+                
+                if (hasSubmit && !hasNext) return 'submit';
+                if (hasNext) return 'next';
+                if (hasSubmit) return 'submit';
+                
+                return 'unknown';
+            }""")
+            return state
+        except Exception:
+            return 'unknown'
+
     async def submit_order(self):
-        """Complete checkout and submit the full order (all items in cart)"""
+        """Complete checkout and submit the full order (all items in cart).
+        
+        Agentic flow — uses fast JS-based page state detection:
+        1. Detects current page state (Next/Submit/ACH/Password/Session expired)
+        2. Acts accordingly at each step
+        3. Handles session expiration gracefully
+        """
         logger.info("Proceeding to checkout - placing full order...")
         
         try:
-            # after item entry: click Next twice to reach payment/checkout
-            for step in range(2):
-                logger.info(f"Clicking Next (item entry step {step+1})...")
-                if not await self._click_next_or_submit("Next", timeout_ms=5000):
-                    raise Exception(f"Could not find Next button (item entry step {step+1})")
+            max_steps = 12  # safety cap to avoid infinite loops
+            step = 0
+            ach_selected = False
+            
+            # ── Phase 1: Navigate through checkout pages adaptively ──
+            while step < max_steps:
+                step += 1
+                
+                # wait for page to settle after navigation
                 try:
-                    await self.page.wait_for_load_state('networkidle', timeout=10000)
+                    await self.page.wait_for_load_state('networkidle', timeout=8000)
                 except Exception:
                     pass
                 await asyncio.sleep(0.3)
+                
+                # fast JS-based page state detection (no selector timeouts)
+                state = await self._detect_page_state()
+                logger.info(f"  Step {step}: Page state = {state}")
+                
+                if state == 'session_expired':
+                    raise Exception("Session expired during checkout — need to re-login and retry")
+                
+                elif state == 'password':
+                    logger.info(f"  Step {step}: Password field detected — at final confirmation")
+                    break
+                
+                elif state in ('ach', 'ach_with_next'):
+                    if not ach_selected:
+                        # select ACH payment
+                        for ctx in ([self._content_frame] if self._content_frame else []) + [self.page] + list(self.page.frames):
+                            for sel in ['text=ACH Debit Bank', ':has-text("ACH Debit Bank")', 'span:has-text("ACH Debit")', 'label:has-text("ACH")']:
+                                try:
+                                    ach = await ctx.wait_for_selector(sel, timeout=1000)
+                                    if ach and await ach.is_visible():
+                                        await ach.click()
+                                        logger.info(f"  Step {step}: Selected ACH Debit Bank")
+                                        ach_selected = True
+                                        await asyncio.sleep(0.2)
+                                        break
+                                except Exception:
+                                    continue
+                            if ach_selected:
+                                break
+                    # after ACH, click Next if available
+                    if state == 'ach_with_next' or await self._detect_page_state() in ('next', 'ach_with_next'):
+                        logger.info(f"  Step {step}: Clicking Next after ACH...")
+                        await self._click_next_or_submit("Next", timeout_ms=3000)
+                    continue
+                
+                elif state == 'next':
+                    logger.info(f"  Step {step}: Clicking Next...")
+                    if not await self._click_next_or_submit("Next", timeout_ms=3000):
+                        raise Exception(f"Next detected but click failed at step {step}")
+                    continue
+                
+                elif state == 'submit':
+                    logger.info(f"  Step {step}: Clicking Submit...")
+                    if not await self._click_next_or_submit("Submit", timeout_ms=3000):
+                        raise Exception("Submit detected but click failed")
+                    continue
+                
+                else:  # unknown
+                    # wait a bit longer and retry detection
+                    logger.warning(f"  Step {step}: Unknown page state, waiting...")
+                    await asyncio.sleep(2)
+                    state = await self._detect_page_state()
+                    if state == 'session_expired':
+                        raise Exception("Session expired during checkout — need to re-login and retry")
+                    if state == 'unknown':
+                        await self.page.screenshot(path="checkout_stuck.png")
+                        logger.error(f"  Step {step}: Stuck — see checkout_stuck.png")
+                        raise Exception(f"Checkout stuck at step {step} - unrecognized page")
+                    # got a valid state on retry, loop back
+                    step -= 1  # don't count this as a step
+                    continue
             
-            # select ACH Debit Bank payment method if present
-            logger.info("Looking for ACH Debit Bank...")
-            for ctx in ([self._content_frame] if self._content_frame else []) + [self.page] + list(self.page.frames):
-                for sel in ['text=ACH Debit Bank', ':has-text("ACH Debit Bank")', 'span:has-text("ACH Debit")', 'label:has-text("ACH")']:
-                    try:
-                        ach = await ctx.wait_for_selector(sel, timeout=2000)
-                        if ach and await ach.is_visible():
-                            await ach.click()
-                            logger.info("Selected ACH Debit Bank")
-                            await asyncio.sleep(0.2)
-                            break
-                    except Exception:
-                        continue
+            if step >= max_steps:
+                raise Exception(f"Checkout exceeded {max_steps} steps — possible infinite loop")
             
-            # checkout: Next (after ACH payment) -> Next (review) -> Next (confirm) -> Submit
-            for step in range(3):
-                logger.info(f"Clicking Next (checkout step {step+1})...")
-                if not await self._click_next_or_submit("Next", timeout_ms=5000):
-                    raise Exception(f"Could not find Next button at checkout step {step+1}")
-                try:
-                    await self.page.wait_for_load_state('networkidle', timeout=10000)
-                except Exception:
-                    pass
-                await asyncio.sleep(0.3)
-            
-            # final submit
-            logger.info("Clicking Submit...")
-            if not await self._click_next_or_submit("Submit"):
-                raise Exception("Could not find Submit button")
-            try:
-                await self.page.wait_for_load_state('networkidle', timeout=10000)
-            except Exception:
-                pass
-            await asyncio.sleep(0.3)
-            
-            # password confirmation - uses keyboard.type for real key events
+            # ── Phase 2: Password confirmation — agentic retry loop ──
             logger.info("Entering confirmation password...")
             password = os.getenv('SITE_PASSWORD')
             if not password:
                 raise Exception("SITE_PASSWORD not set - required for order confirmation")
-            await self._scroll_to_bottom()
-            await asyncio.sleep(0.1)
-            await self._scroll_to_bottom()
-            try:
-                scroll_more = await self.page.query_selector('a.ScrollForMoreLink, a[data-event="ScrollForMore"]')
-                if scroll_more and await scroll_more.is_visible():
-                    await scroll_more.click()
-                    await asyncio.sleep(0.1)
-            except Exception:
-                pass
-            pw_filled = await self._fill_password_field(password)
+            
+            max_password_attempts = 3
+            pw_filled = False
+            for attempt in range(1, max_password_attempts + 1):
+                logger.info(f"Password attempt {attempt}/{max_password_attempts}...")
+                
+                # scroll to make sure password field is visible
+                await self._scroll_to_bottom()
+                await asyncio.sleep(0.2)
+                await self._scroll_to_bottom()
+                
+                # click "scroll for more" link if present
+                try:
+                    scroll_more = await self.page.query_selector('a.ScrollForMoreLink, a[data-event="ScrollForMore"]')
+                    if scroll_more and await scroll_more.is_visible():
+                        await scroll_more.click()
+                        await asyncio.sleep(0.2)
+                except Exception:
+                    pass
+                
+                pw_filled = await self._fill_password_field(password)
+                if pw_filled:
+                    break
+                
+                # agentic recovery: wait, scroll again, let page settle
+                logger.warning(f"  Password attempt {attempt} failed, recovering...")
+                await asyncio.sleep(1.0 * attempt)  # increasing backoff
+                
+                # try clicking elsewhere first to reset focus, then re-scroll
+                try:
+                    await self.page.mouse.click(10, 10)
+                    await asyncio.sleep(0.2)
+                except Exception:
+                    pass
+            
             if not pw_filled:
-                raise Exception("Could not enter password - all methods failed")
+                raise Exception("Could not enter password after all attempts - see password_fail.png")
+            
             await asyncio.sleep(0.1)
-            # click final Submit to confirm after password
+            
+            # ── Phase 3: Final Submit after password ──
             logger.info("Clicking final Submit after password...")
             if not await self._click_next_or_submit("Submit"):
                 raise Exception("Could not find final Submit button after password")

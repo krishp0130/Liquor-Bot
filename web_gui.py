@@ -1589,10 +1589,10 @@ if __name__ == '__main__':
     print("Mississippi DOR Order Bot - Web Interface")
     print("="*50)
     print("\nStarting web server...")
-    print("\n🌐 Open your browser and go to: http://localhost:5050")
+    print("\n🌐 Open your browser and go to: http://localhost:5000")
     print("\nPress Ctrl+C to stop the server\n")
     
     import webbrowser
-    webbrowser.open('http://localhost:5050')
+    webbrowser.open('http://localhost:5000')
     
-    app.run(debug=False, port=5050, host='0.0.0.0')
+    app.run(debug=False, port=5000, host='127.0.0.1')
