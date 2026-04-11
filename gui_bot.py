@@ -12,6 +12,7 @@ import csv
 import time
 import sys
 from datetime import datetime
+import subprocess
 # import bot class
 from bot_script import WebAutomationBot, read_csv_file, update_csv_file  # noqa: F401 - used in run_bot
 
@@ -155,7 +156,77 @@ class BotGUI:
 5. The bot will continuously process orders until stopped"""
         
         ttk.Label(instructions, text=inst_text, justify='left').pack()
-        
+
+        # software update
+        update_frame = ttk.LabelFrame(parent, text="Software Update", padding=10)
+        update_frame.pack(fill='x', padx=10, pady=(10, 10))
+
+        ttk.Label(update_frame, text="Operating System:").grid(row=0, column=0, sticky='w', pady=5)
+        self.update_os_var = tk.StringVar(value='mac')
+        os_combo = ttk.Combobox(update_frame, textvariable=self.update_os_var,
+                                values=['mac', 'windows'], state='readonly', width=12)
+        os_combo.grid(row=0, column=1, pady=5, padx=5, sticky='w')
+
+        self.update_btn = ttk.Button(update_frame, text="Update Bot", command=self._run_update)
+        self.update_btn.grid(row=0, column=2, padx=10)
+
+        self.update_output = scrolledtext.ScrolledText(update_frame, height=8, state='disabled',
+                                                        wrap='word', font=('Courier', 10))
+        self.update_output.grid(row=1, column=0, columnspan=3, sticky='we', pady=(5, 0))
+        update_frame.columnconfigure(0, weight=0)
+        update_frame.columnconfigure(1, weight=0)
+        update_frame.columnconfigure(2, weight=1)
+
+    def _run_update(self):
+        if not messagebox.askyesno("Confirm Update",
+                                   "This will pull the latest code and re-install dependencies. Continue?"):
+            return
+        self.update_btn.configure(state='disabled', text='Updating...')
+        self.update_output.configure(state='normal')
+        self.update_output.delete('1.0', tk.END)
+        self.update_output.insert(tk.END, 'Starting update...\n')
+        self.update_output.configure(state='disabled')
+        threading.Thread(target=self._run_update_thread, daemon=True).start()
+
+    def _run_update_thread(self):
+        bot_dir = Path(__file__).resolve().parent
+        target_os = self.update_os_var.get()
+        if target_os == 'windows':
+            script = bot_dir / 'install-windows.ps1'
+            cmd = ['powershell', '-ExecutionPolicy', 'Bypass', '-File', str(script)]
+        else:
+            script = bot_dir / 'install-mac.sh'
+            cmd = ['bash', str(script)]
+
+        if not script.exists():
+            self._append_update_output(f'Script not found: {script}\n')
+            self.root.after(0, lambda: self.update_btn.configure(state='normal', text='Update Bot'))
+            return
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300, cwd=str(bot_dir))
+            output = result.stdout
+            if result.stderr:
+                output += '\n--- stderr ---\n' + result.stderr
+            if result.returncode == 0:
+                output += '\n✅ Update complete! Restart the bot to use the new version.'
+            else:
+                output += '\n❌ Update failed. See output above.'
+            self._append_update_output(output)
+        except subprocess.TimeoutExpired:
+            self._append_update_output('Update timed out after 5 minutes.\n')
+        except Exception as e:
+            self._append_update_output(f'Error running update: {e}\n')
+        self.root.after(0, lambda: self.update_btn.configure(state='normal', text='Update Bot'))
+
+    def _append_update_output(self, text):
+        def _do():
+            self.update_output.configure(state='normal')
+            self.update_output.insert(tk.END, text)
+            self.update_output.see(tk.END)
+            self.update_output.configure(state='disabled')
+        self.root.after(0, _do)
+
     def create_csv_tab(self, parent):
         # frame for csv controls
         control_frame = ttk.Frame(parent)

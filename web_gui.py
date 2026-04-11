@@ -31,6 +31,7 @@ from pathlib import Path
 import logging
 import os
 import re
+import subprocess
 from datetime import datetime
 from dotenv import load_dotenv
 from odf.opendocument import load as load_ods
@@ -178,6 +179,20 @@ HTML_TEMPLATE = '''
                     <input type="checkbox" id="cooldown-enabled" checked> Enable cooldown breaks
                 </div>
                 <button class="success" onclick="saveCooldownSettings()">💾 Save Cooldown Settings</button>
+            </div>
+
+            <div class="stats-box" style="margin-top: 20px;">
+                <h3>🔄 Software Update</h3>
+                <p style="color: #aaa; font-size: 13px;">Pull the latest code from GitHub and re-install dependencies.</p>
+                <div class="input-group">
+                    <label>Operating System:</label>
+                    <select id="update-os" style="padding: 6px 12px; border-radius: 4px; border: 1px solid #555; background: #2d2d2d; color: #fff;">
+                        <option value="mac">macOS</option>
+                        <option value="windows">Windows</option>
+                    </select>
+                </div>
+                <button onclick="runUpdate()" id="update-btn" style="background: #2196F3;">🔄 Update Bot</button>
+                <pre id="update-output" style="display:none; margin-top:12px; max-height:300px; overflow-y:auto; background:#1a1a1a; padding:10px; border-radius:4px; font-size:12px; white-space:pre-wrap;"></pre>
             </div>
 
             <div class="stats-box" style="margin-top: 30px;">
@@ -862,6 +877,38 @@ HTML_TEMPLATE = '''
                 .then(data => updateStatus(data));
         }, 3000);
 
+        function runUpdate() {
+            const os = document.getElementById('update-os').value;
+            const btn = document.getElementById('update-btn');
+            const output = document.getElementById('update-output');
+            if (!confirm('This will pull the latest code and re-install dependencies. Continue?')) return;
+            btn.disabled = true;
+            btn.textContent = '⏳ Updating...';
+            output.style.display = 'block';
+            output.textContent = 'Starting update...\n';
+            fetch('/update', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({os: os})
+            })
+            .then(r => r.json())
+            .then(data => {
+                output.textContent = data.output || '';
+                if (data.success) {
+                    output.textContent += '\n✅ Update complete! Restart the bot to use the new version.';
+                } else {
+                    output.textContent += '\n❌ Update failed. See output above.';
+                }
+            })
+            .catch(err => {
+                output.textContent += '\nError: ' + err;
+            })
+            .finally(() => {
+                btn.disabled = false;
+                btn.textContent = '🔄 Update Bot';
+            });
+        }
+
         // Load initial data
         loadSettings();
         loadOrders();
@@ -1072,6 +1119,38 @@ def save_cooldown_settings():
     rest_max = data.get('rest_max', 3)
     cooldown_enabled = data.get('cooldown_enabled', True)
     return jsonify({'success': True})
+
+@app.route('/update', methods=['POST'])
+def run_update():
+    """Pull latest code and re-run the appropriate install script."""
+    data = request.json or {}
+    target_os = data.get('os', 'mac').lower()
+    bot_dir = Path(__file__).resolve().parent
+
+    if target_os == 'windows':
+        script = bot_dir / 'install-windows.ps1'
+        if not script.exists():
+            return jsonify({'success': False, 'output': f'Script not found: {script}'}), 404
+        cmd = ['powershell', '-ExecutionPolicy', 'Bypass', '-File', str(script)]
+    else:
+        script = bot_dir / 'install-mac.sh'
+        if not script.exists():
+            return jsonify({'success': False, 'output': f'Script not found: {script}'}), 404
+        cmd = ['bash', str(script)]
+
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=300, cwd=str(bot_dir)
+        )
+        output = result.stdout
+        if result.stderr:
+            output += '\n--- stderr ---\n' + result.stderr
+        success = result.returncode == 0
+        return jsonify({'success': success, 'output': output})
+    except subprocess.TimeoutExpired:
+        return jsonify({'success': False, 'output': 'Update timed out after 5 minutes.'})
+    except Exception as e:
+        return jsonify({'success': False, 'output': f'Error running update: {e}'})
 
 ORDER_DATA_DIR = Path('Order Data')
 
@@ -1589,10 +1668,10 @@ if __name__ == '__main__':
     print("Mississippi DOR Order Bot - Web Interface")
     print("="*50)
     print("\nStarting web server...")
-    print("\n🌐 Open your browser and go to: http://localhost:5000")
+    print("\n🌐 Open your browser and go to: http://localhost:5050")
     print("\nPress Ctrl+C to stop the server\n")
     
     import webbrowser
-    webbrowser.open('http://localhost:5000')
+    webbrowser.open('http://localhost:5050')
     
-    app.run(debug=False, port=5000, host='127.0.0.1')
+    app.run(debug=False, port=5050, host='127.0.0.1')

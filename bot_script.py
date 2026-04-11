@@ -322,6 +322,57 @@ class WebAutomationBot:
                 continue
         raise Exception("Could not find item search input")
     
+    async def _clear_item_search(self, search_input):
+        """Clear the item search field so the next SKU search does not reuse stale text."""
+        try:
+            await search_input.click()
+            await search_input.fill('')
+            await search_input.press('Control+a')
+            await search_input.press('Backspace')
+            await asyncio.sleep(0.1)
+        except Exception:
+            pass
+    
+    async def _poll_add_item_row_state(self, ctx, timeout_ms: int = 1000, interval_ms: int = 55) -> Optional[str]:
+        """Detect stock from the row Add Item control (Glide: EnabledLink vs DisabledLink, disabled attr).
+        Returns 'disabled' (zero / not addable), 'enabled', or None if not yet determinable."""
+        deadline = time.time() + timeout_ms / 1000.0
+        js = """() => {
+            const isAddCaption = (el) => {
+                const t = (el && el.textContent || '').trim();
+                return t === 'Add Item' || (t.length < 24 && t.includes('Add Item'));
+            };
+            const candidates = [];
+            for (const cap of document.querySelectorAll('.ButtonCaptionText, span.ButtonCaptionText')) {
+                if (!isAddCaption(cap)) continue;
+                const btn = cap.closest('button');
+                if (btn && btn.offsetParent) candidates.push(btn);
+            }
+            for (const btn of document.querySelectorAll('button.FastEvt[data-event="LinkClick"], button[data-event="LinkClick"]')) {
+                if (!btn.offsetParent) continue;
+                const t = (btn.textContent || '').trim();
+                if (!t.includes('Add Item')) continue;
+                if (!candidates.includes(btn)) candidates.push(btn);
+            }
+            if (candidates.length === 0) return null;
+            const btn = candidates[0];
+            const cls = btn.className || '';
+            const dis = btn.disabled === true || btn.hasAttribute('disabled');
+            if (dis || cls.includes('DisabledLink')) return 'disabled';
+            if (cls.includes('EnabledLink')) return 'enabled';
+            if (!dis) return 'enabled';
+            return null;
+        }"""
+        while time.time() < deadline:
+            try:
+                state = await ctx.evaluate(js)
+                if state == 'disabled' or state == 'enabled':
+                    return state
+            except Exception:
+                pass
+            await asyncio.sleep(interval_ms / 1000.0)
+        return None
+    
     async def _click_add_item(self):
         """Click Add Item - multiple methods, imperative that one works (Glide/ServiceNow structure)."""
         async def try_click_in_frame(frame):
@@ -458,51 +509,70 @@ class WebAutomationBot:
             await asyncio.sleep(0.6)
         return result
     
-    async def check_and_process_items(self, items):
-        """Check all unfilled items and add any available ones to cart (one order, min 10 total qty).
-        Skips items with order_filled='yes' so ordered items are never re-ordered."""
+    async def check_and_process_items(self, items, max_cycles=3):
+        """Two-phase item checker.
+        Phase 1 — scan every pending item once (normal delays).  Available items
+                  are ordered immediately; zero-qty items are collected.
+        Phase 2 — the collected zeros enter a cyclic deque and are rechecked with
+                  minimal delays up to *max_cycles* full rotations so every item
+                  gets equal attention.
+        Returns (items_found, total_qty_added)."""
+        from collections import deque
+        import random
+
         items_found = []
         total_qty_added = 0
         self.trace_log = getattr(self, 'trace_log', [])
 
-        for item in items:
+        to_check = [it for it in items if str(it.get('order_filled', '')).lower() != 'yes']
+        if not to_check:
+            return items_found, total_qty_added
+
+        pending_nums = [str(it['item_number']) for it in to_check]
+        logger.info(f"Checking {len(to_check)} pending row(s) this pass: {', '.join(pending_nums)}")
+
+        # ── shared helper — returns 'added', 'zero', or 'failed' ──────────
+        async def _process_one(item, is_recheck):
+            """Search for *item*, check availability, add to cart if in stock."""
+            nonlocal total_qty_added
             item_number = item['item_number']
             quantity = int(item['quantity'])
-
-            # skip if already ordered (order_filled persisted to CSV on successful submit)
-            if item.get('order_filled', '').lower() == 'yes':
-                continue
-
-            # skip backorder items (will be picked up in next cycle)
-            if item.get('order_filled', '').lower() == 'backorder':
-                continue
 
             t_item_start = time.time()
             trace = {'item': item_number, 'steps': {}, 'result': '', 'total_ms': 0}
 
-            # Human-like delay between searches (1-3s random)
-            import random
-            delay = random.uniform(1.0, 3.0)
-            logger.info(f"Checking item #{item_number} (requested qty: {quantity})... (waiting {delay:.1f}s)")
+            delay = random.uniform(0.1, 0.3) if is_recheck else random.uniform(1.0, 3.0)
+            logger.info(f"Checking item #{item_number} (qty: {quantity}){' [recheck]' if is_recheck else ''}... (wait {delay:.2f}s)")
             await asyncio.sleep(delay)
 
-            # enter item number - click, clear, type (type() triggers proper input events)
             search_input = await self._get_search_input()
             await search_input.click()
             await search_input.fill('')
             await search_input.type(str(item_number), delay=30)
-            
             await search_input.press('Enter')
-            await self.page.wait_for_load_state('networkidle')
-            await asyncio.sleep(0.5)  # wait for search results to render
+            try:
+                await self.page.wait_for_load_state('networkidle', timeout=20000)
+            except Exception:
+                pass
 
-            # STEP 1: Read available qty FIRST — skip immediately if 0
             try:
                 ctx = self._content_frame if self._content_frame else self.page
-
-                logger.info(f"  [STEP 1] Reading available qty for item #{item_number}...")
                 t0 = time.time()
                 available_quantity = -1
+
+                add_btn_state = await self._poll_add_item_row_state(ctx, timeout_ms=1200, interval_ms=50)
+                if add_btn_state == 'disabled':
+                    logger.info(f"  x Item #{item_number} — Add Item disabled (no stock)")
+                    trace['steps']['read_qty'] = round((time.time() - t0) * 1000)
+                    trace['result'] = 'SKIP (qty 0)'
+                    trace['total_ms'] = round((time.time() - t_item_start) * 1000)
+                    self.trace_log.append(trace)
+                    await self._clear_item_search(search_input)
+                    return 'zero'
+
+                if add_btn_state == 'enabled':
+                    logger.info(f"  [STEP 1] Add Item enabled — reading qty label for cap...")
+
                 try:
                     el = await ctx.wait_for_selector('span[id="fgvt_Dm-m-1"]', timeout=3000)
                     available_text = await el.text_content() or '0'
@@ -513,17 +583,14 @@ class WebAutomationBot:
 
                 trace['steps']['read_qty'] = round((time.time() - t0) * 1000)
 
-                # If qty is 0, skip — don't waste 15s trying to click inactive Add Item
                 if available_quantity == 0:
-                    delay = random.uniform(1.0, 3.0)
-                    logger.info(f"  x Item #{item_number} — available qty is 0, skipping (waiting {delay:.1f}s)")
-                    await asyncio.sleep(delay)
+                    logger.info(f"  x Item #{item_number} — available qty is 0, skipping")
                     trace['result'] = 'SKIP (qty 0)'
                     trace['total_ms'] = round((time.time() - t_item_start) * 1000)
                     self.trace_log.append(trace)
-                    raise Exception("Available quantity is 0")
+                    await self._clear_item_search(search_input)
+                    return 'zero'
 
-                # If qty > 0, adjust order qty if needed
                 backorder_qty = 0
                 if available_quantity > 0:
                     logger.info(f"  ✓ Item #{item_number} is AVAILABLE! (qty: {available_quantity})")
@@ -534,7 +601,6 @@ class WebAutomationBot:
                     else:
                         logger.info(f"    Using requested quantity: {quantity}")
                 else:
-                    # Could not read qty via fgvt_Dm-m-1 — try broader selectors
                     logger.info(f"  [STEP 1] Trying broader qty selectors...")
                     for qty_sel in ['span[id^="fgvt_Dm"]', 'span[id^="fgvt_"]']:
                         try:
@@ -559,24 +625,16 @@ class WebAutomationBot:
                         else:
                             logger.info(f"    Using requested quantity: {quantity}")
                     else:
-                        # Still unknown — check if Add Item button is active as last resort
-                        logger.info(f"  [STEP 1] Qty still unknown, checking Add Item button state...")
-                        add_item_visible = None
-                        for sel in ['span:has-text("Add Item")', 'button:has-text("Add Item")']:
-                            try:
-                                add_item_visible = await ctx.wait_for_selector(sel, timeout=1000)
-                                if add_item_visible:
-                                    break
-                            except Exception:
-                                continue
-                        if not add_item_visible:
-                            delay = random.uniform(1.0, 3.0)
-                            logger.info(f"  x Item #{item_number} — not available, skipping (waiting {delay:.1f}s)")
-                            await asyncio.sleep(delay)
-                            raise Exception("Add Item button not found and qty unknown")
+                        if add_btn_state != 'enabled':
+                            logger.info(f"  x Item #{item_number} — not available, skipping")
+                            trace['result'] = 'SKIP (unavailable)'
+                            trace['total_ms'] = round((time.time() - t_item_start) * 1000)
+                            self.trace_log.append(trace)
+                            await self._clear_item_search(search_input)
+                            return 'zero'
                         logger.warning(f"  ⚠ Item #{item_number} — qty unknown but Add Item active, using requested qty: {quantity}")
 
-                # click Add Item button
+                # STEP 2 — click row Add Item
                 logger.info(f"  [STEP 2] Clicking Add Item button...")
                 add_clicked = await self._click_add_item()
                 if add_clicked:
@@ -589,17 +647,19 @@ class WebAutomationBot:
                     }""")
                     logger.error(f"  [STEP 2] FAILED - Add Item elements on page: {html_snippet}")
                     raise Exception("Failed to click Add Item - see add_item_fail.png")
-                await self.page.wait_for_load_state('networkidle')
-                await asyncio.sleep(0.4)  # wait for quantity modal to open
+                try:
+                    await self.page.wait_for_load_state('networkidle', timeout=20000)
+                except Exception:
+                    pass
+                await asyncio.sleep(0.4)
 
-                # Type quantity into modal (use adjusted qty if we capped by available), then click Add Item
+                # STEP 3 — enter quantity in modal
                 qty_str = str(int(quantity))
                 logger.info(f"  [STEP 3] Entering quantity {qty_str} for item #{item_number}...")
                 done = False
                 all_frames = [self.page] + list(self.page.frames)
                 for frame in all_frames:
                     try:
-                        # Find quantity input - id Ds_1-81, class DocControlQuantity
                         result = await frame.evaluate(f"""() => {{
                             const qtyInput = document.querySelector('input[id="Ds_1-81"]') || document.querySelector('input[id^="Ds_1"]') || document.querySelector('input.DocControlQuantity') || document.querySelector('input[name="Ds_1-81"]');
                             if (!qtyInput || !qtyInput.offsetParent) return false;
@@ -629,7 +689,6 @@ class WebAutomationBot:
                         continue
                 if not done:
                     logger.info(f"  [STEP 3] JS method failed, trying Playwright method...")
-                    # Playwright: find quantity input by exact id/class
                     for frame in all_frames:
                         try:
                             qty_input = await frame.query_selector('input[id="Ds_1-81"]') or await frame.query_selector('input[id^="Ds_1"]') or await frame.query_selector('input.DocControlQuantity')
@@ -649,16 +708,18 @@ class WebAutomationBot:
                 if not done:
                     await self.page.screenshot(path="qty_modal_fail.png")
                     raise Exception("Could not enter quantity — see qty_modal_fail.png")
-                await self.page.wait_for_load_state('networkidle')
-                await asyncio.sleep(0.2)  # wait for modal to close
+                try:
+                    await self.page.wait_for_load_state('networkidle', timeout=20000)
+                except Exception:
+                    pass
+                await asyncio.sleep(0.2)
 
-                # mark item as processed
+                # STEP 4 — mark ordered
                 item['order_filled'] = 'yes'
-                item['quantity'] = quantity  # update to actual ordered qty
+                item['quantity'] = quantity
                 items_found.append(item)
                 total_qty_added += quantity
 
-                # create backorder entry for remaining qty
                 if backorder_qty > 0:
                     backorder_item = {
                         'item_number': item_number,
@@ -672,6 +733,8 @@ class WebAutomationBot:
                 trace['total_ms'] = round((time.time() - t_item_start) * 1000)
                 self.trace_log.append(trace)
                 logger.info(f"  [STEP 4] ✓ Added to cart: {quantity} units (total: {total_qty_added}) [{trace['total_ms']}ms]")
+                await self._clear_item_search(search_input)
+                return 'added'
 
             except Exception as e:
                 logger.error(f"  ✗ Item #{item_number} FAILED at: {e}")
@@ -685,14 +748,47 @@ class WebAutomationBot:
                 except Exception:
                     pass
                 try:
-                    search_input = await self._get_search_input()
-                    await search_input.click()
-                    await search_input.press('Control+a')
-                    await search_input.press('Backspace')
-                    await asyncio.sleep(0.1)
+                    si = await self._get_search_input()
+                    await self._clear_item_search(si)
                 except Exception:
                     pass
-        
+                return 'failed'
+
+        # ── Phase 1: scan every item once — order available, collect zeros ──
+        zero_queue = deque()
+        logger.info(f"  === Phase 1: initial scan ({len(to_check)} items) ===")
+        for item in to_check:
+            if str(item.get('order_filled', '')).lower() == 'yes':
+                continue
+            result = await _process_one(item, is_recheck=False)
+            if result == 'zero':
+                zero_queue.append(item)
+
+        if not zero_queue:
+            return items_found, total_qty_added
+
+        # ── Phase 2: cycle zeros in a deque with fast rechecks ──────────
+        for cycle in range(max_cycles):
+            cycle_size = len(zero_queue)
+            if cycle_size == 0:
+                break
+            logger.info(f"  === Phase 2 cycle {cycle + 1}/{max_cycles}: {cycle_size} zero item(s) in queue ===")
+
+            for _ in range(cycle_size):
+                if not zero_queue:
+                    break
+                item = zero_queue.popleft()
+                if str(item.get('order_filled', '')).lower() == 'yes':
+                    continue
+                result = await _process_one(item, is_recheck=True)
+                if result == 'zero':
+                    zero_queue.append(item)
+
+            if zero_queue and cycle < max_cycles - 1:
+                pause = random.uniform(0.3, 0.8)
+                logger.info(f"  {len(zero_queue)} items still zero. Recycling in {pause:.1f}s...")
+                await asyncio.sleep(pause)
+
         return items_found, total_qty_added
     
     async def _scroll_to_bottom(self):
