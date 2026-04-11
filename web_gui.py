@@ -885,7 +885,7 @@ HTML_TEMPLATE = '''
             btn.disabled = true;
             btn.textContent = '⏳ Updating...';
             output.style.display = 'block';
-            output.textContent = 'Starting update...\n';
+            output.textContent = 'Starting update...\\n';
             fetch('/update', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
@@ -895,13 +895,13 @@ HTML_TEMPLATE = '''
             .then(data => {
                 output.textContent = data.output || '';
                 if (data.success) {
-                    output.textContent += '\n✅ Update complete! Restart the bot to use the new version.';
+                    output.textContent += '\\n✅ Update complete! Restart the bot to use the new version.';
                 } else {
-                    output.textContent += '\n❌ Update failed. See output above.';
+                    output.textContent += '\\n❌ Update failed. See output above.';
                 }
             })
             .catch(err => {
-                output.textContent += '\nError: ' + err;
+                output.textContent += '\\nError: ' + err;
             })
             .finally(() => {
                 btn.disabled = false;
