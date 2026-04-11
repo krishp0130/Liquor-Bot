@@ -427,8 +427,8 @@ HTML_TEMPLATE = '''
             const size = document.getElementById('item_size').value.trim();
             const quantity = document.getElementById('quantity').value;
             
-            if (!item_number || !quantity || !name || !size) {
-                alert('Please enter item number, name, size, and quantity');
+            if (!item_number || !quantity) {
+                alert('Please enter item number and quantity');
                 return;
             }
             
