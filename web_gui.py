@@ -591,6 +591,7 @@ HTML_TEMPLATE = '''
         let orderDataResults = [];
         let orderDataSortKey = 'order_date';
         let orderDataSortAsc = false;
+        let searchHistory = [];
         
         function loadOrderFiles() {
             fetch('/get_order_files')
@@ -654,6 +655,12 @@ HTML_TEMPLATE = '''
             let items = orderDataResults;
             if (raw) {
                 const parts = raw.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+                // Update search history: most recent term last
+                parts.forEach(p => {
+                    const idx = searchHistory.indexOf(p);
+                    if (idx !== -1) searchHistory.splice(idx, 1);
+                    searchHistory.push(p);
+                });
                 const numericParts = parts.filter(p => /^[0-9]+$/.test(p));
                 if (numericParts.length === parts.length && numericParts.length > 0) {
                     const numSet = new Set(numericParts);
@@ -666,6 +673,25 @@ HTML_TEMPLATE = '''
                             i.category.toLowerCase().includes(p)
                         )
                     );
+                }
+                // Sort so the most recently searched term's matches appear first
+                if (searchHistory.length > 0) {
+                    items.sort((a, b) => {
+                        const aKey = a.item_num.toLowerCase();
+                        const bKey = b.item_num.toLowerCase();
+                        const aName = a.name.toLowerCase();
+                        const bName = b.name.toLowerCase();
+                        const aCat = (a.category || '').toLowerCase();
+                        const bCat = (b.category || '').toLowerCase();
+                        let aRank = -1, bRank = -1;
+                        for (let i = searchHistory.length - 1; i >= 0; i--) {
+                            const term = searchHistory[i];
+                            if (aRank === -1 && (aKey === term || aKey.includes(term) || aName.includes(term) || aCat.includes(term))) aRank = i;
+                            if (bRank === -1 && (bKey === term || bKey.includes(term) || bName.includes(term) || bCat.includes(term))) bRank = i;
+                            if (aRank !== -1 && bRank !== -1) break;
+                        }
+                        return bRank - aRank;
+                    });
                 }
             }
             const tbody = table.querySelector('tbody');
