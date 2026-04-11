@@ -509,15 +509,12 @@ class WebAutomationBot:
             await asyncio.sleep(0.6)
         return result
     
-    async def check_and_process_items(self, items, max_cycles=3):
-        """Two-phase item checker.
-        Phase 1 — scan every pending item once (normal delays).  Available items
-                  are ordered immediately; zero-qty items are collected.
-        Phase 2 — the collected zeros enter a cyclic deque and are rechecked with
-                  minimal delays up to *max_cycles* full rotations so every item
-                  gets equal attention.
+    async def check_and_process_items(self, items):
+        """Scan every pending item once. Available items are added to cart;
+        zero-qty items are skipped. Returns as soon as the 10-qty minimum
+        is reached so the caller can submit immediately and loop back to
+        re-check the remaining zeros on a fresh pass.
         Returns (items_found, total_qty_added)."""
-        from collections import deque
         import random
 
         items_found = []
@@ -754,40 +751,20 @@ class WebAutomationBot:
                     pass
                 return 'failed'
 
-        # ── Phase 1: scan every item once — order available, collect zeros ──
-        zero_queue = deque()
-        logger.info(f"  === Phase 1: initial scan ({len(to_check)} items) ===")
+        # ── Scan every pending item, adding all available ones to the cart.
+        #    Zero-qty items are skipped. After the full scan, return so the
+        #    caller can submit if >= 10 qty, then loop back to re-check the
+        #    zeros on a fresh pass. ──
+        logger.info(f"  === Scanning {len(to_check)} items ===")
         for item in to_check:
             if str(item.get('order_filled', '')).lower() == 'yes':
                 continue
-            result = await _process_one(item, is_recheck=False)
-            if result == 'zero':
-                zero_queue.append(item)
+            await _process_one(item, is_recheck=False)
 
-        if not zero_queue:
-            return items_found, total_qty_added
-
-        # ── Phase 2: cycle zeros in a deque with fast rechecks ──────────
-        for cycle in range(max_cycles):
-            cycle_size = len(zero_queue)
-            if cycle_size == 0:
-                break
-            logger.info(f"  === Phase 2 cycle {cycle + 1}/{max_cycles}: {cycle_size} zero item(s) in queue ===")
-
-            for _ in range(cycle_size):
-                if not zero_queue:
-                    break
-                item = zero_queue.popleft()
-                if str(item.get('order_filled', '')).lower() == 'yes':
-                    continue
-                result = await _process_one(item, is_recheck=True)
-                if result == 'zero':
-                    zero_queue.append(item)
-
-            if zero_queue and cycle < max_cycles - 1:
-                pause = random.uniform(0.3, 0.8)
-                logger.info(f"  {len(zero_queue)} items still zero. Recycling in {pause:.1f}s...")
-                await asyncio.sleep(pause)
+        if items_found:
+            logger.info(f"  === Scan complete: {len(items_found)} item(s) in cart, {total_qty_added} total qty ===")
+        else:
+            logger.info(f"  === Scan complete: no items available ===")
 
         return items_found, total_qty_added
     
