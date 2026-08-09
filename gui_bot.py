@@ -358,10 +358,19 @@ class BotGUI:
         
         # set up logging handler
         log_handler = GuiLogHandler(self.log_text)
-        log_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', 
+        log_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s',
                                                   datefmt='%H:%M:%S'))
         logging.getLogger().addHandler(log_handler)
         logging.getLogger().setLevel(logging.INFO)
+
+        # start remote log viewer (http://127.0.0.1:5051)
+        try:
+            from log_server import install_log_collector, start_server as start_log_server
+            install_log_collector()
+            start_log_server()
+            logging.getLogger().info("Remote log viewer at http://127.0.0.1:5051")
+        except Exception as e:
+            logging.getLogger().warning(f"Log server failed to start: {e}")
         
     def load_env_settings(self):
         # load from .env file if exists

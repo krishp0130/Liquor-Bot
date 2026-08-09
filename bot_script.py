@@ -36,6 +36,9 @@ logger = logging.getLogger(__name__)
 # loading env variables
 load_dotenv()
 
+DIAG_DIR = Path(__file__).parent / "diagnostics"
+
+
 class WebAutomationBot:
     def __init__(self, headless: bool = False):
         self.headless = headless
@@ -44,6 +47,64 @@ class WebAutomationBot:
         self.page = None
         self.playwright = None
         self._content_frame = None  # frame that has item entry (may be iframe)
+
+    async def _capture_diagnostic(self, label: str):
+        """Capture screenshot + page state for self-diagnosis.
+        Pushes to in-memory log server (viewable at http://127.0.0.1:5051 Diagnostics tab).
+        Also saves to diagnostics/ folder as backup."""
+        try:
+            # Take screenshot as bytes
+            screenshot_bytes = await self.page.screenshot(full_page=True)
+            logger.info(f"[diag] Screenshot captured for '{label}'")
+
+            # Page HTML
+            html = await self.page.content()
+
+            # Scan all contexts for inputs/buttons
+            report = {"label": label, "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"), "url": self.page.url, "contexts": {}}
+            contexts = [("main_page", self.page)]
+            if self._content_frame:
+                contexts.insert(0, ("content_frame", self._content_frame))
+            for i, fr in enumerate(self.page.frames):
+                if fr != self.page and fr != self._content_frame:
+                    contexts.append((f"frame_{i}", fr))
+
+            for ctx_name, ctx in contexts:
+                try:
+                    inputs = await ctx.evaluate("""() => {
+                        return Array.from(document.querySelectorAll('input, select, button, [role="button"]')).map(el => ({
+                            tag: el.tagName, id: el.id, name: el.name || '',
+                            type: el.type || '', cls: (el.className || '').substring(0, 60),
+                            text: (el.textContent || '').substring(0, 40).trim(),
+                            vis: !!el.offsetParent, w: el.offsetWidth, h: el.offsetHeight
+                        })).filter(e => e.id || e.name || e.type === 'password' || e.tag === 'BUTTON');
+                    }""")
+                    report["contexts"][ctx_name] = inputs
+                    logger.info(f"[diag] {ctx_name}: {len(inputs)} elements found")
+                except Exception:
+                    report["contexts"][ctx_name] = "evaluate failed"
+
+            # Push to log server in-memory (auto-viewable in browser)
+            try:
+                from log_server import store_diagnostic
+                store_diagnostic(label, screenshot_bytes=screenshot_bytes, report=report, html_snippet=html[:30000])
+                logger.info(f"[diag] Pushed to log server — view at http://127.0.0.1:5051 (Diagnostics tab)")
+            except Exception as e:
+                logger.warning(f"[diag] Could not push to log server: {e}")
+
+            # Also save to disk as backup
+            DIAG_DIR.mkdir(exist_ok=True)
+            ts = time.strftime("%Y%m%d-%H%M%S")
+            prefix = DIAG_DIR / f"{ts}_{label}"
+            with open(f"{prefix}.png", "wb") as f:
+                f.write(screenshot_bytes)
+            import json as _json
+            with open(f"{prefix}.json", "w") as f:
+                _json.dump(report, f, indent=2)
+            logger.info(f"[diag] Backup saved: {prefix}.png + .json")
+
+        except Exception as e:
+            logger.error(f"[diag] Failed to capture diagnostic: {e}")
     
     async def setup(self, use_saved_auth: bool = True):
         """Initialize browser and login if needed"""
@@ -720,197 +781,345 @@ class WebAutomationBot:
     
     async def _click_next_or_submit(self, text: str, timeout_ms: int = 3000):
         """Click Next or Submit - span.ActionButtonCaptionText structure.
-        Scrolls to bottom so buttons are visible, then clicks."""
+        Scrolls to bottom so buttons are visible, then clicks.
+        Fast path: query_selector (instant) before wait_for_selector (slow)."""
         await self._scroll_to_bottom()
         await asyncio.sleep(0.1)
         await self._scroll_to_bottom()
+
+        selectors = [
+            f'span.ActionButtonCaptionText:has-text("{text}")',
+            f'span:has-text("{text}")',
+            f'button:has-text("{text}")',
+        ]
         contexts = ([self._content_frame] if self._content_frame else []) + [self.page] + list(self.page.frames)
+
+        # Fast path: instant query_selector across all contexts
         for ctx in contexts:
-            for sel in [
-                f'span.ActionButtonCaptionText:has-text("{text}")',
-                f'xpath=//span[@class="ActionButtonCaptionText" and contains(., "{text}")]',
-                f'span:has-text("{text}")',
-                f'button:has-text("{text}")',
-            ]:
+            for sel in selectors:
+                try:
+                    btn = await ctx.query_selector(sel)
+                    if btn and await btn.is_visible():
+                        await btn.scroll_into_view_if_needed()
+                        await btn.click()
+                        logger.info(f"Clicked '{text}' via fast query_selector")
+                        return True
+                except Exception:
+                    continue
+
+        # JS click via ActionButtonCaptionText parent (fast, no wait)
+        for ctx in contexts:
+            try:
+                clicked = await ctx.evaluate(f"""() => {{
+                    const spans = document.querySelectorAll('span.ActionButtonCaptionText');
+                    for (const s of spans) {{
+                        if (s.textContent.trim().includes('{text}')) {{
+                            const p = s.closest('button, div[role="button"], [class*="ActionButton"], [class*="Button"]') || s.parentElement;
+                            if (p && p.offsetParent) {{ p.click(); return true; }}
+                            s.click(); return true;
+                        }}
+                    }}
+                    return false;
+                }}""")
+                if clicked:
+                    logger.info(f"Clicked '{text}' via JS parent click")
+                    return True
+            except Exception:
+                continue
+
+        # Slow fallback: wait_for_selector with short timeout (only if fast paths failed)
+        logger.info(f"Fast paths failed for '{text}', trying wait_for_selector...")
+        for ctx in contexts:
+            for sel in selectors:
                 try:
                     btn = await ctx.wait_for_selector(sel, timeout=timeout_ms)
                     if btn and await btn.is_visible():
                         await btn.scroll_into_view_if_needed()
                         await btn.click()
+                        logger.info(f"Clicked '{text}' via wait_for_selector fallback")
                         return True
                 except Exception:
                     continue
-            # try clicking parent via JS (span may be inside button - parent receives click)
-            try:
-                span = await ctx.wait_for_selector(f'span.ActionButtonCaptionText:has-text("{text}")', timeout=timeout_ms)
-                if span and await span.is_visible():
-                    clicked = await span.evaluate("""el => {
-                        const p = el.closest('button, div[role="button"], [class*="ActionButton"], [class*="Button"]') || el.parentElement;
-                        if (p && p.offsetParent) { p.click(); return true; }
-                        return false;
-                    }""")
-                    if clicked:
-                        return True
-            except Exception:
-                pass
         return False
     
     async def _fill_password_field(self, password: str) -> bool:
-        """Click input#Dn-k and type password using real keyboard events.
-        Field has FastEvtFieldKeyDown/FastEvtFieldFocus so needs actual key events."""
-        
-        # Method 1: JS focus + page.keyboard (fires real key events per character)
-        logger.info("Attempting password entry...")
-        try:
-            focused = await self.page.evaluate("""() => {
-                const el = document.getElementById('Dn-k') || document.querySelector('input[name="Dn-k"]') || document.querySelector('input.DocControlPassword');
-                if (!el) return false;
-                el.scrollIntoView({block: 'center'});
-                el.focus();
-                el.click();
-                el.value = '';
-                el.dispatchEvent(new Event('focus', {bubbles: true}));
-                return true;
-            }""")
-            if focused:
-                await asyncio.sleep(0.05)
-                await self.page.keyboard.type(password, delay=10)
-                logger.info("Password entered (JS focus + keyboard.type)")
-                return True
-        except Exception as e:
-            logger.warning(f"Password method 1 failed: {e}")
-        
-        # Method 2: Playwright click on input then keyboard.type
-        for sel in ['input#Dn-k', 'input[name="Dn-k"]', 'input.DocControlPassword']:
+        """Find password input and type using real keyboard events.
+        ServiceNow renders in iframe — search content frame FIRST.
+        Glide IDs are dynamic so we use type='password' as primary selector."""
+        import time
+        start = time.time()
+
+        pw_selectors = [
+            'input[type="password"]',
+            'input.DocControlPassword',
+            'input[id^="Dn"]',
+            'input#Dn-k',
+            'input[name="Dn-k"]',
+        ]
+
+        # Build context list: content frame FIRST, then page, then all frames
+        all_contexts = []
+        if self._content_frame:
+            all_contexts.append(('content_frame', self._content_frame))
+        all_contexts.append(('main_page', self.page))
+        for i, fr in enumerate(self.page.frames):
+            if fr != self.page and fr != self._content_frame:
+                all_contexts.append((f'frame_{i}', fr))
+
+        logger.info(f"[password] Attempting entry across {len(all_contexts)} contexts...")
+
+        # Method 1: JS focus + keyboard.type — try each context
+        for ctx_name, ctx in all_contexts:
             try:
-                el = await self.page.wait_for_selector(sel, timeout=2000)
-                if el and await el.is_visible():
-                    await el.scroll_into_view_if_needed()
-                    await el.click(force=True)
+                focused = await ctx.evaluate("""() => {
+                    const sels = ['input[type="password"]', 'input.DocControlPassword', 'input[id^="Dn"]'];
+                    for (const sel of sels) {
+                        const el = document.querySelector(sel);
+                        if (el) {
+                            el.scrollIntoView({block: 'center'});
+                            el.focus();
+                            el.click();
+                            el.value = '';
+                            el.dispatchEvent(new Event('focus', {bubbles: true}));
+                            return sel + ' (id=' + el.id + ', type=' + el.type + ')';
+                        }
+                    }
+                    return null;
+                }""")
+                if focused:
                     await asyncio.sleep(0.05)
-                    await self.page.keyboard.press('Control+a')
-                    await self.page.keyboard.press('Delete')
                     await self.page.keyboard.type(password, delay=10)
-                    logger.info(f"Password entered (click {sel} + keyboard.type)")
+                    logger.info(f"[password] Entered via JS focus in {ctx_name}: {focused} ({time.time()-start:.1f}s)")
                     return True
+                else:
+                    logger.info(f"[password] JS focus: no password input found in {ctx_name}")
             except Exception as e:
-                logger.warning(f"Password method 2 ({sel}) failed: {e}")
-        
-        # Method 3: same as above but searching all frames
-        for fr in list(self.page.frames):
-            for sel in ['input#Dn-k', 'input[name="Dn-k"]']:
+                logger.warning(f"[password] JS focus failed in {ctx_name}: {e}")
+
+        # Method 2: Playwright query_selector + click — try each context
+        for ctx_name, ctx in all_contexts:
+            for sel in pw_selectors:
                 try:
-                    el = await fr.wait_for_selector(sel, timeout=1500)
-                    if el and await el.is_visible():
+                    el = await ctx.query_selector(sel)
+                    if el:
+                        is_vis = await el.is_visible()
+                        logger.info(f"[password] Found {sel} in {ctx_name}, visible={is_vis}")
+                        if is_vis:
+                            await el.scroll_into_view_if_needed()
+                            await el.click(force=True)
+                            await asyncio.sleep(0.05)
+                            await self.page.keyboard.press('Control+a')
+                            await self.page.keyboard.press('Delete')
+                            await self.page.keyboard.type(password, delay=10)
+                            logger.info(f"[password] Entered via click {sel} in {ctx_name} ({time.time()-start:.1f}s)")
+                            return True
+                        else:
+                            # Try clicking even if not "visible" — Glide hides things oddly
+                            await el.click(force=True)
+                            await asyncio.sleep(0.05)
+                            await self.page.keyboard.type(password, delay=10)
+                            logger.info(f"[password] Entered via force-click {sel} in {ctx_name} ({time.time()-start:.1f}s)")
+                            return True
+                except Exception:
+                    pass
+
+        # Method 3: wait_for_selector with timeout — password may appear after delay
+        logger.info(f"[password] Fast methods failed ({time.time()-start:.1f}s), trying wait_for_selector...")
+        for ctx_name, ctx in all_contexts:
+            for sel in pw_selectors[:3]:
+                try:
+                    el = await ctx.wait_for_selector(sel, timeout=3000)
+                    if el:
+                        logger.info(f"[password] wait_for_selector found {sel} in {ctx_name}")
                         await el.scroll_into_view_if_needed()
                         await el.click(force=True)
                         await asyncio.sleep(0.05)
                         await self.page.keyboard.press('Control+a')
                         await self.page.keyboard.press('Delete')
                         await self.page.keyboard.type(password, delay=10)
-                        logger.info("Password entered (frame + keyboard.type)")
+                        logger.info(f"[password] Entered via wait {sel} in {ctx_name} ({time.time()-start:.1f}s)")
                         return True
                 except Exception:
                     pass
-        
-        # Method 4: Tab into field from known page state, then type
+
+        # Method 4: Tab into field
         try:
+            logger.info("[password] Trying Tab method...")
             await self.page.keyboard.press('Tab')
             await asyncio.sleep(0.05)
             await self.page.keyboard.type(password, delay=10)
-            logger.info("Password entered (Tab + keyboard.type)")
+            logger.info(f"[password] Entered via Tab ({time.time()-start:.1f}s)")
             return True
         except Exception as e:
-            logger.warning(f"Password method 4 failed: {e}")
+            logger.warning(f"[password] Tab method failed: {e}")
+
+        # Self-diagnosis: capture screenshot + full page state
+        logger.error(f"[password] ALL METHODS FAILED after {time.time()-start:.1f}s — capturing diagnostic...")
+        await self._capture_diagnostic("password_failed")
         
         return False
     
-    async def submit_order(self):
-        """Complete checkout and submit the full order (all items in cart)"""
-        logger.info("Proceeding to checkout - placing full order...")
-        
+    async def _wait_for_wizard_transition(self, timeout_s: float = 3.0):
+        """Wait for ServiceNow wizard page transition.
+        Uses domcontentloaded (fast) instead of networkidle (Glide never settles)."""
         try:
-            # after item entry: click Next twice to reach payment/checkout
-            for step in range(2):
-                logger.info(f"Clicking Next (item entry step {step+1})...")
-                if not await self._click_next_or_submit("Next", timeout_ms=5000):
-                    raise Exception(f"Could not find Next button (item entry step {step+1})")
+            await self.page.wait_for_load_state('domcontentloaded', timeout=timeout_s * 1000)
+        except Exception:
+            pass
+        await asyncio.sleep(0.8)  # let Glide JS render the new step
+
+    async def _click_wizard_button(self, text: str, step_label: str, max_retries: int = 3) -> bool:
+        """Click a wizard button with retry. Waits for button to appear after page transition."""
+        import time
+        start = time.time()
+        logger.info(f"[wizard] {step_label}: looking for '{text}' button...")
+
+        for attempt in range(max_retries):
+            if attempt > 0:
+                logger.info(f"[wizard] {step_label}: retry {attempt}, waiting for button...")
+                await asyncio.sleep(1.0)
+
+            clicked = await self._click_next_or_submit(text, timeout_ms=2000)
+            if clicked:
+                elapsed = time.time() - start
+                logger.info(f"[wizard] {step_label}: clicked '{text}' in {elapsed:.1f}s")
+                return True
+
+        elapsed = time.time() - start
+        logger.error(f"[wizard] {step_label}: FAILED to find '{text}' after {elapsed:.1f}s")
+        return False
+
+    async def _find_and_click_ach(self) -> bool:
+        """Select ACH Debit Bank payment — fast query_selector first."""
+        import time
+        start = time.time()
+        logger.info("[wizard] Looking for ACH Debit Bank...")
+
+        contexts = ([self._content_frame] if self._content_frame else []) + [self.page] + list(self.page.frames)
+
+        # Fast: query_selector (instant)
+        for ctx in contexts:
+            for sel in ['text=ACH Debit Bank', 'span:has-text("ACH Debit")', 'label:has-text("ACH")']:
                 try:
-                    await self.page.wait_for_load_state('networkidle', timeout=10000)
+                    el = await ctx.query_selector(sel)
+                    if el and await el.is_visible():
+                        await el.click()
+                        logger.info(f"[wizard] Selected ACH in {time.time()-start:.1f}s (fast)")
+                        return True
                 except Exception:
-                    pass
-                await asyncio.sleep(0.3)
-            
-            # select ACH Debit Bank payment method if present
-            logger.info("Looking for ACH Debit Bank...")
-            for ctx in ([self._content_frame] if self._content_frame else []) + [self.page] + list(self.page.frames):
-                for sel in ['text=ACH Debit Bank', ':has-text("ACH Debit Bank")', 'span:has-text("ACH Debit")', 'label:has-text("ACH")']:
-                    try:
-                        ach = await ctx.wait_for_selector(sel, timeout=2000)
-                        if ach and await ach.is_visible():
-                            await ach.click()
-                            logger.info("Selected ACH Debit Bank")
-                            await asyncio.sleep(0.2)
-                            break
-                    except Exception:
-                        continue
-            
-            # checkout: Next (after ACH payment) -> Next (review) -> Next (confirm) -> Submit
-            for step in range(3):
-                logger.info(f"Clicking Next (checkout step {step+1})...")
-                if not await self._click_next_or_submit("Next", timeout_ms=5000):
-                    raise Exception(f"Could not find Next button at checkout step {step+1}")
-                try:
-                    await self.page.wait_for_load_state('networkidle', timeout=10000)
-                except Exception:
-                    pass
-                await asyncio.sleep(0.3)
-            
-            # final submit
-            logger.info("Clicking Submit...")
-            if not await self._click_next_or_submit("Submit"):
-                raise Exception("Could not find Submit button")
+                    continue
+
+        # JS fallback: click by text content
+        for ctx in contexts:
             try:
-                await self.page.wait_for_load_state('networkidle', timeout=10000)
+                clicked = await ctx.evaluate("""() => {
+                    const els = document.querySelectorAll('span, label, div, td');
+                    for (const el of els) {
+                        if (el.textContent.trim().includes('ACH Debit Bank') && el.offsetParent) {
+                            el.click(); return true;
+                        }
+                    }
+                    return false;
+                }""")
+                if clicked:
+                    logger.info(f"[wizard] Selected ACH in {time.time()-start:.1f}s (JS)")
+                    return True
             except Exception:
-                pass
-            await asyncio.sleep(0.3)
-            
-            # password confirmation - uses keyboard.type for real key events
-            logger.info("Entering confirmation password...")
+                continue
+
+        # Slow fallback: wait_for_selector
+        for ctx in contexts:
+            try:
+                el = await ctx.wait_for_selector('text=ACH Debit Bank', timeout=3000)
+                if el and await el.is_visible():
+                    await el.click()
+                    logger.info(f"[wizard] Selected ACH in {time.time()-start:.1f}s (wait)")
+                    return True
+            except Exception:
+                continue
+
+        logger.warning(f"[wizard] ACH not found after {time.time()-start:.1f}s - continuing anyway")
+        return False
+
+    async def submit_order(self):
+        """Complete checkout and submit the full order (all items in cart).
+        Wizard: Next×2 → ACH → Next×3 → Submit → Password → final Submit"""
+        import time
+        overall_start = time.time()
+        logger.info("=" * 50)
+        logger.info("Proceeding to checkout - placing full order...")
+
+        try:
+            # Step 1-2: item entry → click Next twice
+            for step in range(2):
+                if not await self._click_wizard_button("Next", f"item-entry-{step+1}"):
+                    raise Exception(f"Could not find Next button (item entry step {step+1})")
+                await self._wait_for_wizard_transition()
+
+            # Step 3: select ACH Debit Bank payment
+            await self._find_and_click_ach()
+            await asyncio.sleep(0.5)
+
+            # Step 4-6: checkout Next buttons
+            for step in range(3):
+                if not await self._click_wizard_button("Next", f"checkout-{step+1}"):
+                    raise Exception(f"Could not find Next button at checkout step {step+1}")
+                await self._wait_for_wizard_transition()
+
+            # Step 7: Submit button
+            if not await self._click_wizard_button("Submit", "submit"):
+                raise Exception("Could not find Submit button")
+            await self._wait_for_wizard_transition()
+
+            # Step 8: password confirmation
+            logger.info("[wizard] Entering confirmation password...")
             password = os.getenv('SITE_PASSWORD')
             if not password:
                 raise Exception("SITE_PASSWORD not set - required for order confirmation")
+
+            # ALWAYS capture diagnostic before password attempt so we can see the page
+            await self._capture_diagnostic("before_password")
+            logger.info("[wizard] Diagnostic captured — now attempting password entry...")
+
+            # Scroll to reveal password field
             await self._scroll_to_bottom()
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.5)
             await self._scroll_to_bottom()
             try:
                 scroll_more = await self.page.query_selector('a.ScrollForMoreLink, a[data-event="ScrollForMore"]')
                 if scroll_more and await scroll_more.is_visible():
                     await scroll_more.click()
-                    await asyncio.sleep(0.1)
+                    await asyncio.sleep(0.5)
+                    logger.info("[wizard] Clicked 'Scroll for More' link")
             except Exception:
                 pass
+
+            # Wait a moment for any lazy-loaded content
+            await asyncio.sleep(1.0)
+
             pw_filled = await self._fill_password_field(password)
             if not pw_filled:
+                await self._capture_diagnostic("password_failed")
                 raise Exception("Could not enter password - all methods failed")
-            await asyncio.sleep(0.1)
-            # click final Submit to confirm after password
-            logger.info("Clicking final Submit after password...")
-            if not await self._click_next_or_submit("Submit"):
+
+            await asyncio.sleep(0.3)
+
+            # Step 9: final Submit after password
+            logger.info("[wizard] Clicking final Submit after password...")
+            if not await self._click_wizard_button("Submit", "final-submit"):
                 raise Exception("Could not find final Submit button after password")
-            
-            try:
-                await self.page.wait_for_load_state('networkidle', timeout=10000)
-            except Exception:
-                pass
-            
-            logger.info("✓ Order submitted successfully!")
-            await asyncio.sleep(1)  # wait for confirmation
+
+            await self._wait_for_wizard_transition()
+
+            elapsed = time.time() - overall_start
+            logger.info(f"✓ Order submitted successfully! Total checkout time: {elapsed:.1f}s")
+            await asyncio.sleep(1)
             return True
-            
+
         except Exception as e:
-            logger.error(f"Error during checkout: {e}")
+            elapsed = time.time() - overall_start
+            logger.error(f"Error during checkout after {elapsed:.1f}s: {e}")
+            await self._capture_diagnostic("checkout_failed")
             raise
 
     async def process_multiple_items(self, items):

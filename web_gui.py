@@ -886,6 +886,15 @@ log_handler = LogCapture()
 log_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S'))
 logging.getLogger().addHandler(log_handler)
 
+# Start remote log viewer (http://127.0.0.1:5051) for self-diagnosis
+try:
+    from log_server import install_log_collector, start_server as start_log_server
+    install_log_collector()
+    start_log_server()
+    logging.getLogger().info("Remote log viewer at http://127.0.0.1:5051")
+except Exception as e:
+    logging.getLogger().warning(f"Log server failed to start: {e}")
+
 @app.route('/')
 def index():
     return render_template_string(HTML_TEMPLATE)
